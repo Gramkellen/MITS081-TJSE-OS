@@ -7,6 +7,9 @@
 #include "syscall.h"
 #include "defs.h"
 
+extern uint64 sys_trace(void);
+extern uint64 sys_info(void);
+
 // Fetch the uint64 at addr from the current process.
 int
 fetchaddr(uint64 addr, uint64 *ip)
@@ -105,7 +108,7 @@ extern uint64 sys_wait(void);
 extern uint64 sys_write(void);
 extern uint64 sys_uptime(void);
 
-static uint64 (*syscalls[])(void) = {
+static uint64 (*syscalls[])(void)S = {
 [SYS_fork]    sys_fork,
 [SYS_exit]    sys_exit,
 [SYS_wait]    sys_wait,
@@ -127,6 +130,35 @@ static uint64 (*syscalls[])(void) = {
 [SYS_link]    sys_link,
 [SYS_mkdir]   sys_mkdir,
 [SYS_close]   sys_close,
+[SYS_trace]   sys_trace,
+[SYS_sysinfo] sys_info,
+};
+
+//参照syscalls 用系统调用号索引系统调用名称的数组
+static char *syscall_names[] = {
+[SYS_fork]    "fork",
+[SYS_exit]    "exit",
+[SYS_wait]    "wait",
+[SYS_pipe]    "pipe",
+[SYS_read]    "read",
+[SYS_kill]    "kill",
+[SYS_exec]    "exec",
+[SYS_fstat]   "fstat",
+[SYS_chdir]   "chdir",
+[SYS_dup]     "dup",
+[SYS_getpid]  "getpid",
+[SYS_sbrk]    "sbrk",
+[SYS_sleep]   "sleep",
+[SYS_uptime]  "uptime",
+[SYS_open]    "open",
+[SYS_write]   "write",
+[SYS_mknod]   "mknod",
+[SYS_unlink]  "unlink",
+[SYS_link]    "link",
+[SYS_mkdir]   "mkdir",
+[SYS_close]   "close",
+[SYS_trace]   "trace",
+[SYS_sysinfo] "sys_info",
 };
 
 void
@@ -135,9 +167,13 @@ syscall(void)
   int num;
   struct proc *p = myproc();
 
-  num = p->trapframe->a7;
+  num = p->trapframe->a7;           //a7存储系统调用号
   if(num > 0 && num < NELEM(syscalls) && syscalls[num]) {
-    p->trapframe->a0 = syscalls[num]();
+    p->trapframe->a0 = syscalls[num](); //通过syscalls[num]得到对应返回值置于a0
+    if ((p->tracemask & (1 << num)) != 0) {  //按位判断是否需要系统调用           
+        char *syscall_name = syscall_names[num];                                     
+        printf("%d: syscall %s -> %d\n", p->pid, syscall_name, p->trapframe->a0); 
+    }              
   } else {
     printf("%d %s: unknown sys call %d\n",
             p->pid, p->name, num);

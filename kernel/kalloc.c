@@ -80,3 +80,21 @@ kalloc(void)
     memset((char*)r, 5, PGSIZE); // fill with junk
   return (void*)r;
 }
+
+uint64
+kfreeNum(void)
+{
+    //观察kfree函数，空闲的进程数量其实是存储在列表当中的
+    struct run *r;
+    uint64 freenum = 0;
+
+    acquire(&kmem.lock);
+    r = kmem.freelist;
+    while (r)
+    {
+        freenum++;
+        r = r->next;
+    }
+    release(&kmem.lock);
+    return freenum * PGSIZE;  //需要乘每一页的字节数
+}

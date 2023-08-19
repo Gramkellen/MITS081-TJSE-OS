@@ -97,7 +97,7 @@ allocproc(void)
   for(p = proc; p < &proc[NPROC]; p++) {
     acquire(&p->lock);
     if(p->state == UNUSED) {
-      goto found;
+      goto found;      //如果找到空的槽位，进行跳转
     } else {
       release(&p->lock);
     }
@@ -126,7 +126,7 @@ found:
   memset(&p->context, 0, sizeof(p->context));
   p->context.ra = (uint64)forkret;
   p->context.sp = p->kstack + PGSIZE;
-
+  p->tracemask = 0;                  //add 
   return p;
 }
 
@@ -260,19 +260,20 @@ fork(void)
 {
   int i, pid;
   struct proc *np;
-  struct proc *p = myproc();
+  struct proc *p = myproc();  //获取父进程的PCB
 
   // Allocate process.
   if((np = allocproc()) == 0){
     return -1;
   }
 
+  np->tracemask = p->tracemask;   //继承父进程的tracemask
   // Copy user memory from parent to child.
   if(uvmcopy(p->pagetable, np->pagetable, p->sz) < 0){
     freeproc(np);
     release(&np->lock);
     return -1;
-  }
+  }S
   np->sz = p->sz;
 
   np->parent = p;
@@ -692,4 +693,18 @@ procdump(void)
     printf("%d %s %s", p->pid, state, p->name);
     printf("\n");
   }
+}
+
+uint64
+kcountProc(void) {
+  struct proc *p;
+  uint64 count = 0;
+  for(p = proc; p < &proc[NPROC]; p++) {
+    acquire(&p->lock);
+    if(p->state != UNUSED) {   //不是空的就加加
+      count += 1;
+    }
+    release(&p->lock);
+  }
+  return count;
 }

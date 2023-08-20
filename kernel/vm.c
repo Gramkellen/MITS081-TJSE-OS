@@ -5,6 +5,9 @@
 #include "riscv.h"
 #include "defs.h"
 #include "fs.h"
+#include "spinlock.h"
+#include "proc.h"
+
 
 /*
  * the kernel's page table.
@@ -14,7 +17,6 @@ pagetable_t kernel_pagetable;
 extern char etext[];  // kernel.ld sets this to end of kernel code.
 
 extern char trampoline[]; // trampoline.S
-
 /*
  * create a direct-map page table for the kernel.
  */
@@ -440,3 +442,157 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
     return -1;
   }
 }
+
+// Recursive helper
+void vmprintHelper(pagetable_t pagetable, int depth) {
+  static char* indent[] = {
+      "",
+      "..",
+      ".. ..",
+      ".. .. .."
+  };
+  if (depth <= 0 || depth >= 4) {
+    panic("vmprintHelper: depth not in {1, 2, 3}");
+  }
+  
+  for (int i = 0; i < 512; i++) {
+    pte_t pte = pagetable[i];
+    if (pte & PTE_V) { //是一个有效的PTE
+      printf("%s%d: pte %p pa %p\n", indent[depth], i, pte, PTE2PA(pte));
+      if ((pte & (PTE_R|PTE_W|PTE_X)) == 0) {
+        uint64 child = PTE2PA(pte);
+        vmprintHelper((pagetable_t)child, depth+1); // 递归, 深度+1
+      }
+    }
+  }
+}
+
+void vmprint(pagetable_t pagetable) {
+  printf("page table %p\n", pagetable);
+  vmprintHelper(pagetable, 1);
+}
+
+//参照vminit进行实现：
+pagetable_t
+ukvminit(void)
+{
+    pagetable_t kernel_pagetable = (pagetable_t)kalloc();
+    if (kernel_pagetable == 0)
+    {
+    	return kernel_pagetable;
+    }
+
+    memset(kernel_pagetable,0,PGSIZE);
+
+    mappages(kernel_pagetable,UART0,PGSIZE,UART0,PTE_R | PTE_W);
+
+    mappages(kernel_pagetable,VIRTIO0,PGSIZE,VIRTIO0,PTE_R | PTE_W);
+
+    mappages(kernel_pagetable,CLINT,0x10000,CLINT,PTE_R | PTE_W);
+
+    mappages(kernel_pagetable,PLIC, 0x400000,PLIC, PTE_R | PTE_W);
+
+    mappages(kernel_pagetable,KERNBASE, (uint64)etext-KERNBASE,KERNBASE,  PTE_R | PTE_X);
+
+    mappages(kernel_pagetable,(uint64)etext, PHYSTOP-(uint64)etext, (uint64)etext,PTE_R | PTE_W);
+
+    mappages(kernel_pagetable,TRAMPOLINE,  PGSIZE, (uint64)trampoline,PTE_R | PTE_X);
+
+    return kernel_pagetable;
+}
+
+void
+ukvmunmap(pagetable_t pagetable, uint64 va, uint64 npages)
+{
+  uint64 a;
+  pte_t *pte;
+
+  if((va % PGSIZE) != 0)
+    panic("ukvmunmap: not aligned");
+
+  for(a = va; a < va + npages*PGSIZE; a += PGSIZE){
+    if((pte = walk(pagetable, a, 0)) == 0)
+      goto clean;
+    if((*pte & PTE_V) == 0)
+      goto clean;
+    if(PTE_FLAGS(*pte) == PTE_V)
+      panic("ukvmunmap: not a leaf");
+
+    clean:
+      *pte = 0;
+  }
+}
+
+void
+ufreewalk(pagetable_t pagetable)
+{
+  for(int i = 0; i < 512; i++){
+    pte_t pte = pagetable[i];
+    if((pte & PTE_V) && (pte & (PTE_R|PTE_W|PTE_X)) == 0){
+      uint64 child = PTE2PA(pte);
+      ufreewalk((pagetable_t)child);
+      pagetable[i] = 0;
+    }
+    pagetable[i] = 0;
+  }
+  kfree((void*)pagetable);
+}
+
+void freeprockvm(struct proc *p) {
+  // 按分配顺序的逆序来销毁映射, 但不回收物理地址
+  ukvmunmap(p->kernel_pagetable, p->kstack, PGSIZE/PGSIZE);
+  ukvmunmap(p->kernel_pagetable, TRAMPOLINE, PGSIZE/PGSIZE);
+  ukvmunmap(p->kernel_pagetable, (uint64)etext, (PHYSTOP-(uint64)etext)/PGSIZE);
+  ukvmunmap(p->kernel_pagetable, KERNBASE, ((uint64)etext-KERNBASE)/PGSIZE);
+  ukvmunmap(p->kernel_pagetable, PLIC, 0x400000/PGSIZE);
+  ukvmunmap(p->kernel_pagetable, CLINT, 0x10000/PGSIZE);
+  ukvmunmap(p->kernel_pagetable, VIRTIO0, PGSIZE/PGSIZE);
+  ukvmunmap(p->kernel_pagetable, UART0, PGSIZE/PGSIZE);
+  ufreewalk(p->kernel_pagetable);
+}
+
+//参照了mappages进行撰写
+int umappages(pagetable_t pagetable, uint64 va, uint64 size, uint64 pa, int perm) {
+  uint64 a, last;
+  pte_t *pte;
+
+  a = PGROUNDDOWN(va);
+  last = PGROUNDDOWN(va + size - 1);
+  for(;;){
+    if((pte = walk(pagetable, a, 1)) == 0)
+      return -1;
+    *pte = PA2PTE(pa) | perm | PTE_V;
+    if(a == last)
+      break;
+    a += PGSIZE;
+    pa += PGSIZE;
+  }
+  return 0;
+}
+
+//进行地址映射
+int
+pagecopy(pagetable_t oldpage, pagetable_t newpage, uint64 begin, uint64 end) {
+  pte_t *pte;
+  uint64 pa, i;
+  uint flags;
+  begin = PGROUNDUP(begin);
+
+  for (i = begin; i < end; i += PGSIZE) {
+    if ((pte = walk(oldpage, i, 0)) == 0)
+      panic("pagecopy walk oldpage nullptr");
+    if ((*pte & PTE_V) == 0)
+      panic("pagecopy oldpage pte not valid");
+    pa = PTE2PA(*pte);
+    flags = PTE_FLAGS(*pte) & (~PTE_U); // 把U flag抹去
+    if (umappages(newpage, i, PGSIZE, pa, flags) != 0) {
+      goto err;
+    }
+  }
+  return 0;
+
+err:
+  uvmunmap(newpage, 0, i / PGSIZE, 1);
+  return -1;
+}
+

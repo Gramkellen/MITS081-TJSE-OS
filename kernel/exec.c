@@ -108,13 +108,21 @@ exec(char *path, char **argv)
       last = s+1;
   safestrcpy(p->name, last, sizeof(p->name));
     
-  // Commit to the user image.
   oldpagetable = p->pagetable;
   p->pagetable = pagetable;
   p->sz = sz;
   p->trapframe->epc = elf.entry;  // initial program counter = main
   p->trapframe->sp = sp; // initial stack pointer
   proc_freepagetable(oldpagetable, oldsz);
+  //复制新的kernel_pagetable
+  if (pagecopy(p->pagetable, p->kernel_pagetable, 0, p->sz) != 0) {
+    goto bad;
+  }
+  // 刷新内存映射
+  w_satp(MAKE_SATP(p->kernel_pagetable));
+  sfence_vma();
+  if (p->pid == 1)
+    vmprint(p->pagetable);
 
   return argc; // this ends up in a0, the first argument to main(argc, argv)
 

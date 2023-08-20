@@ -120,7 +120,20 @@ found:
     release(&p->lock);
     return 0;
   }
-
+  //为进程分配一个专属的内存页
+  p->kernel_pagetable = ukvminit();
+  if(p->kernel_pagetable == 0) {  //说明分配失败
+    freeproc(p);
+    release(&p->lock);
+    return 0;
+  }
+  //加入映射
+  uint64 va = KSTACK((int) (p - proc));
+  pte_t pa = kvmpa(va);
+  memset((void *)pa, 0, PGSIZE); // 刷新清空kernel stack
+  mappages(p->kernel_pagetable, va, PGSIZE, (uint64)pa, PTE_R | PTE_W);
+  p->kstack = va;
+ 
   // Set up new context to start executing at forkret,
   // which returns to user space.
   memset(&p->context, 0, sizeof(p->context));
@@ -150,6 +163,14 @@ freeproc(struct proc *p)
   p->killed = 0;
   p->xstate = 0;
   p->state = UNUSED;
+  //修改free函数，释放调内核页表
+  if (p->kernel_pagetable) {
+    freeprockvm(p);
+    p->kernel_pagetable = 0;
+  }
+  if (p->kstack) {
+    p->kstack = 0;
+  }
 }
 
 // Create a user page table for a given process,
@@ -220,7 +241,8 @@ userinit(void)
   // and data into it.
   uvminit(p->pagetable, initcode, sizeof(initcode));
   p->sz = PGSIZE;
-
+  //第一个用户页表进行复制
+  pagecopy(p->pagetable, p->kernel_pagetable, 0, p->sz);
   // prepare for the very first "return" from kernel to user.
   p->trapframe->epc = 0;      // user program counter
   p->trapframe->sp = PGSIZE;  // user stack pointer
@@ -246,9 +268,18 @@ growproc(int n)
     if((sz = uvmalloc(p->pagetable, sz, sz + n)) == 0) {
       return -1;
     }
+    if (pagecopy(p->pagetable, p->kernel_pagetable, p->sz, sz) != 0) {
+     // 增量同步[old size, new size]
+      return -1;
+    }
   } else if(n < 0){
     sz = uvmdealloc(p->pagetable, sz, sz + n);
+    if (sz != p->sz) {
+    // 缩量同步[new size, old size]
+    uvmunmap(p->kernel_pagetable, PGROUNDUP(sz), (PGROUNDUP(p->sz) - PGROUNDUP(sz)) / PGSIZE, 0);
+    }
   }
+  //ukvminithard(p->kernel_pagetable);
   p->sz = sz;
   return 0;
 }
@@ -274,7 +305,12 @@ fork(void)
     return -1;
   }
   np->sz = p->sz;
-
+  //进行页复制
+  if (pagecopy(np->pagetable, np->kernel_pagetable, 0, np->sz) != 0) {
+    freeproc(np);
+    release(&np->lock);
+    return -1;
+  }
   np->parent = p;
 
   // copy saved user registers.
@@ -473,8 +509,12 @@ scheduler(void)
         // before jumping back to us.
         p->state = RUNNING;
         c->proc = p;
+        //切换到内核页表
+        w_satp(MAKE_SATP(p->kernel_pagetable));
+        sfence_vma();
         swtch(&c->context, &p->context);
-
+	//回到全局内核表
+	kvminithart();
         // Process is done running for now.
         // It should have changed its p->state before coming back.
         c->proc = 0;
